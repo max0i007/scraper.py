@@ -223,16 +223,37 @@ class VideoScraper:
                 
             logger.info(f"Extracted slug: {slug}")
             
-            # Fetch the page
+            # Fetch the page with improved timeout and retry handling
             logger.info(f"Fetching URL: {url}")
-            response = self.session.get(url)
-            response.raise_for_status()
+            try:
+                response = self.session.get(url, timeout=30)
+                response.raise_for_status()
+            except requests.Timeout:
+                logger.error("Request timed out, retrying once with increased timeout")
+                response = self.session.get(url, timeout=60)
+                response.raise_for_status()
+            except requests.ConnectionError as ce:
+                logger.error(f"Connection error: {ce}")
+                # Retry with different headers
+                backup_headers = {
+                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36',
+                    'Accept': '*/*',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                }
+                logger.info("Retrying with alternate headers")
+                response = requests.get(url, headers=backup_headers, timeout=60)
+                response.raise_for_status()
             
             # Find eval-packed JavaScript
             packed_scripts = self.find_eval_packed_js(response.text)
             logger.info(f"Found {len(packed_scripts)} packed scripts")
             
+            # Debugging for empty response or no scripts
             if not packed_scripts:
+                logger.warning("No packed scripts found, response length: " + str(len(response.text)))
+                # Save a sample of the response for debugging
+                sample = response.text[:500] + "..." if len(response.text) > 500 else response.text
+                logger.debug(f"Response sample: {sample}")
                 return M3U8Response(success=False, error="No eval-packed scripts found")
             
             # Process each packed script
@@ -241,20 +262,74 @@ class VideoScraper:
             for i, packed_script in enumerate(packed_scripts):
                 logger.info(f"Processing packed script {i+1}")
                 
+                # Debug info for script size
+                script_size = len(packed_script)
+                logger.debug(f"Script {i+1} size: {script_size} bytes")
+                
                 # Unpack the JavaScript
                 unpacked_js = self.unpack_js(packed_script)
                 if not unpacked_js:
                     logger.warning(f"Failed to unpack script {i+1}")
-                    continue
+                    # Try a third approach as last resort
+                    try:
+                        logger.info("Attempting third unpacking method for script")
+                        # Simplified unpacker for highly obfuscated scripts
+                        ctx = execjs.compile("""
+                        function simpleUnpack(code) {
+                            try {
+                                var sandbox = {
+                                    result: '',
+                                    console: { log: function(x) { this.result += x + '\\n'; } }
+                                };
+                                
+                                // Replace eval with console.log to capture output
+                                code = code.replace(/\\beval\\b/g, 'console.log');
+                                
+                                // Execute with sandbox
+                                Function('console', code)(sandbox.console);
+                                
+                                return sandbox.result;
+                            } catch(e) {
+                                return "Error: " + e.toString();
+                            }
+                        }
+                        """)
+                        unpacked_js = ctx.call("simpleUnpack", packed_script)
+                        if unpacked_js and not unpacked_js.startswith("Error:"):
+                            logger.info("Third unpacking method succeeded")
+                        else:
+                            logger.warning("Third unpacking method also failed")
+                            continue
+                    except Exception as e:
+                        logger.error(f"Third unpacker error: {e}")
+                        continue
                 
                 # Extract m3u8 links
                 m3u8_links = self.extract_m3u8_links(unpacked_js)
                 all_m3u8_links.extend(m3u8_links)
                 
                 logger.info(f"Found {len(m3u8_links)} m3u8 links in script {i+1}")
+                
+                # If no m3u8 links found, try a more aggressive pattern
+                if not m3u8_links:
+                    logger.info("No links found with standard patterns, trying more aggressive patterns")
+                    # Look for any URL with .m3u8 in it
+                    aggressive_pattern = r'["\']?(https?://[^"\'\s]+?\.m3u8[^"\'\s]*)["\']?'
+                    aggressive_links = re.findall(aggressive_pattern, unpacked_js)
+                    logger.info(f"Found {len(aggressive_links)} links with aggressive pattern")
+                    all_m3u8_links.extend(aggressive_links)
             
             # Remove duplicates from all found links
             unique_m3u8_links = list(dict.fromkeys(all_m3u8_links))
+            
+            # If no links found at all, return appropriate error
+            if not unique_m3u8_links:
+                return M3U8Response(
+                    success=False,
+                    slug=slug,
+                    total_packed_scripts=len(packed_scripts),
+                    error="No m3u8 links found in any scripts"
+                )
             
             return M3U8Response(
                 success=True,
@@ -317,4 +392,17 @@ async def scrape_by_slug(slug: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import os
+    
+    # Get port from environment variable (for deployment platforms like Render)
+    port = int(os.environ.get("PORT", 8000))
+    
+    # Configure uvicorn with restart on file changes for development
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=port,
+        log_level="info",
+        timeout_keep_alive=120,  # Increase keep-alive timeout
+        proxy_headers=True       # Trust X-Forwarded-* headers for proper IP handling
+    )
