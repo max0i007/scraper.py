@@ -11,8 +11,10 @@ from pydantic import BaseModel, HttpUrl
 from fastapi.middleware.cors import CORSMiddleware
 
 # Set up logging
-logging.basicConfig(level=logging.INFO, 
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # FastAPI app
@@ -39,6 +41,7 @@ class M3U8Response(BaseModel):
     m3u8_links: List[str] = []
     count: int = 0
     error: Optional[str] = None
+
 
 class VideoScraper:
     def __init__(self):
@@ -73,33 +76,91 @@ class VideoScraper:
         return matches
 
     def unpack_js(self, packed_js):
-        """Unpack eval-packed JavaScript."""
-        # Create JavaScript context for unpacking
-        ctx = execjs.compile("""
-        function unpack(code) {
-            var env = {
-                eval: function(c) { result = c; },
-                window: {},
-                document: {}
-            };
-            var result;
-            eval("with(env) {" + code + "}");
-            return result;
-        }
-        """)
-        
+        """Unpack eval-packed JavaScript with better error handling."""
         try:
+            # First try standard unpacking
+            ctx = execjs.compile("""
+            function unpack(code) {
+                var env = {
+                    eval: function(c) { result = c; },
+                    window: {},
+                    document: {}
+                };
+                var result;
+                eval("with(env) {" + code + "}");
+                return result;
+            }
+            """)
             unpacked = ctx.call("unpack", packed_js)
+            
+            # If that fails, try alternative unpacking approaches
+            if not unpacked or len(unpacked) < 100:  # Too short to be meaningful
+                # Try alternative unpacker
+                ctx = execjs.compile("""
+                function unPack(code) {
+                    function indent(code) {
+                        var tabs = 0, old=-1, add='';
+                        for(var i=0;i<code.length;i++) {
+                            if(code[i].indexOf("{") != -1) tabs++;
+                            if(code[i].indexOf("}") != -1) tabs--;
+                            
+                            if(old != tabs) {
+                                old = tabs;
+                                add = "";
+                                while (old > 0) {
+                                    add += "\\t";
+                                    old--;
+                                }
+                                old = tabs;
+                            }
+                            
+                            code[i] = add + code[i];
+                        }
+                        return code;
+                    }
+                    
+                    var env = {
+                        eval: function(c) { code = c; },
+                        window: {},
+                        document: {}
+                    };
+                    
+                    eval("with(env) {" + code + "}");
+                    
+                    code = (code+"").replace(/;/g, ";\\n").replace(/{/g, "\\n{\\n").replace(/}/g, "\\n}\\n").replace(/\\n;\\n/g, ";\\n").replace(/\\n\\n/g, "\\n");
+                    
+                    code = code.split("\\n");
+                    code = indent(code);
+                    
+                    return code.join("\\n");
+                }
+                """)
+                unpacked = ctx.call("unPack", packed_js)
+                
             return unpacked
         except Exception as e:
             logger.error(f"Error unpacking JavaScript: {e}")
             return None
 
     def extract_m3u8_links(self, unpacked_js):
-        """Extract m3u8 links from unpacked JavaScript."""
-        # Pattern to match m3u8 URLs
-        m3u8_pattern = r'https?://[^"\']+\.m3u8[^"\'\s]*'
-        m3u8_links = re.findall(m3u8_pattern, unpacked_js)
+        """Extract m3u8 links from unpacked JavaScript with JWPlayer patterns."""
+        # Pattern to match JWPlayer setup with sources array
+        jwplayer_pattern = r'sources\s*:\s*\[([^\]]+)\]'
+        jwplayer_matches = re.findall(jwplayer_pattern, unpacked_js, re.DOTALL)
+        
+        m3u8_links = []
+        
+        # If we found JWPlayer sources array
+        if jwplayer_matches:
+            sources_text = jwplayer_matches[0]
+            # Now look for file URLs within the sources
+            file_pattern = r'file\s*:\s*["\']([^"\']+\.m3u8[^"\']*)["\']'
+            m3u8_links = re.findall(file_pattern, sources_text)
+        
+        # Also look for general m3u8 URLs as fallback
+        general_pattern = r'https?://[^"\'\s]+\.m3u8[^"\'\s]*'
+        general_links = re.findall(general_pattern, unpacked_js)
+        m3u8_links.extend(general_links)
         
         # Filter out duplicates while preserving order
         unique_links = []
@@ -210,8 +271,10 @@ class VideoScraper:
             logger.error(f"Unexpected error: {e}")
             return M3U8Response(success=False, error=f"Unexpected error: {str(e)}")
 
+
 # Initialize scraper
 scraper = VideoScraper()
+
 
 @app.get("/", response_model=dict)
 async def root():
@@ -223,6 +286,7 @@ async def root():
             "/scrape/{slug}": "Scrape m3u8 links using a video slug"
         }
     }
+
 
 @app.get("/scrape", response_model=M3U8Response)
 async def scrape_url(url: str = Query(..., description="URL to scrape for m3u8 links")):
@@ -236,6 +300,7 @@ async def scrape_url(url: str = Query(..., description="URL to scrape for m3u8 l
         logger.error(f"Error in scrape endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.get("/scrape/{slug}", response_model=M3U8Response)
 async def scrape_by_slug(slug: str):
     """
@@ -248,6 +313,7 @@ async def scrape_by_slug(slug: str):
     except Exception as e:
         logger.error(f"Error in scrape_by_slug endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 if __name__ == "__main__":
     import uvicorn
